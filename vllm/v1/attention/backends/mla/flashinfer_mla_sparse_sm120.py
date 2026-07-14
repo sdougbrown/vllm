@@ -62,9 +62,9 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
-        if self.kv_cache_dtype != "fp8_ds_mla":
+        if self.kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla"):
             raise NotImplementedError(
-                "FLASHINFER_MLA_SPARSE_SM120 requires the packed fp8_ds_mla "
+                "FLASHINFER_MLA_SPARSE_SM120 requires the packed fp8_ds_mla or nvfp4_ds_mla "
                 f"KV cache layout; got kv_cache_dtype={kv_cache_dtype!r}."
             )
 
