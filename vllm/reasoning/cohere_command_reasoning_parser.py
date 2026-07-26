@@ -35,6 +35,7 @@ from vllm.sampling_params import StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 
 REPLACEMENT_CHAR = "\ufffd"
+EMPTY_REASONING_PREFIX = "<|START_THINKING|><|END_THINKING|>"
 
 
 class CohereTagRegistry(NamedTuple):
@@ -405,6 +406,8 @@ def _schema_dict_from_structured_outputs(
 
 
 class BaseCohereCommandReasoningParser(ReasoningParser):
+    prime_no_reasoning_prompt_state: bool = False
+
     def __init__(
         self,
         tokenizer: TokenizerLike,
@@ -417,6 +420,7 @@ class BaseCohereCommandReasoningParser(ReasoningParser):
         self.start_token_id = tokenizer.convert_tokens_to_ids("<|START_THINKING|>")
         self.end_token_id = tokenizer.convert_tokens_to_ids("<|END_THINKING|>")
         self.chatbot_token_id = tokenizer.convert_tokens_to_ids("<|CHATBOT_TOKEN|>")
+        self.chat_template_kwargs = kwargs.get("chat_template_kwargs") or {}
         self.unary_opts = unary_opts
         self.melody_unary = PyFilter(unary_opts)
         self.melody_streaming = PyFilter(streaming_opts)
@@ -461,6 +465,31 @@ class BaseCohereCommandReasoningParser(ReasoningParser):
     def extract_reasoning(
         self, model_output: str, request: ChatCompletionRequest | ResponsesRequest
     ) -> tuple[str | None, str | None]:
+        # In no-reasoning mode the chat template closes an empty reasoning block
+        # in the prompt. The unary parser only receives generated text, unlike
+        # the streaming parser, which can inspect prompt token IDs. If the model
+        # then emits bare response text (or starts directly with an action tag),
+        # Melody otherwise interprets the entire generation as reasoning.
+        # Reconstruct the prompt-side state before unary parsing so non-streaming
+        # and streaming responses classify the same generated tokens identically.
+        # Serving passes the already-merged renderer kwargs to the parser
+        # constructor; retain request kwargs as a fallback for direct callers.
+        template_kwargs = dict(request.chat_template_kwargs or {})
+        template_kwargs.update(self.chat_template_kwargs)
+        if "reasoning" in template_kwargs:
+            # Match Jinja truthiness when an explicit template override takes
+            # precedence over the OpenAI reasoning-effort field.
+            reasoning_disabled = not bool(template_kwargs["reasoning"])
+        else:
+            reasoning_effort = getattr(request, "reasoning_effort", None)
+            if reasoning_effort is None:
+                reasoning = getattr(request, "reasoning", None)
+                reasoning_effort = getattr(reasoning, "effort", None)
+            reasoning_disabled = reasoning_effort == "none"
+
+        if self.prime_no_reasoning_prompt_state and reasoning_disabled:
+            model_output = EMPTY_REASONING_PREFIX + model_output
+
         result = self.melody_unary.process_full_text(model_output)
         return result.reasoning, result.content
 
@@ -561,6 +590,8 @@ class CohereCommand3ReasoningParser(BaseCohereCommandReasoningParser):
 
 
 class CohereCommand4ReasoningParser(BaseCohereCommandReasoningParser):
+    prime_no_reasoning_prompt_state = True
+
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
         super().__init__(
             tokenizer,

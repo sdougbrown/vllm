@@ -21,6 +21,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     StructuralTagResponseFormat,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.parser.abstract_parser import DelegatingParser
 from vllm.reasoning.cohere_command_reasoning_parser import (
     CohereCommand3ReasoningParser,
     CohereCommand4ReasoningParser,
@@ -30,6 +31,7 @@ from vllm.reasoning.cohere_command_reasoning_parser import (
     convert_schema_to_structural_tags,
 )
 from vllm.sampling_params import StructuredOutputsParams
+from vllm.tool_parsers.cohere_command_tool_parser import CohereCommand4ToolParser
 
 
 @dataclass
@@ -178,6 +180,33 @@ def _token_deltas(tokenizer, text: str) -> list[str]:
     return deltas
 
 
+class MockCohereCommand4Parser(DelegatingParser):
+    reasoning_parser_cls = CohereCommand4ReasoningParser
+    tool_parser_cls = CohereCommand4ToolParser
+
+
+def _stream_messages(tokenizer, text: str, request: ChatCompletionRequest):
+    parser = MockCohereCommand4Parser(tokenizer, request.tools)
+    prompt_token_ids = [
+        tokenizer.convert_tokens_to_ids("<|CHATBOT_TOKEN|>"),
+        tokenizer.convert_tokens_to_ids("<|START_THINKING|>"),
+        tokenizer.convert_tokens_to_ids("<|END_THINKING|>"),
+    ]
+    deltas = _token_deltas(tokenizer, text)
+    messages = []
+    for index, delta in enumerate(deltas):
+        message = parser.parse_delta(
+            delta,
+            [0],
+            request,
+            prompt_token_ids=prompt_token_ids if index == 0 else None,
+            finished=index == len(deltas) - 1,
+        )
+        if message is not None:
+            messages.append(message)
+    return messages
+
+
 @pytest.mark.parametrize("case", REASONING_CASES)
 class TestExtractReasoning:
     def test_nonstreaming(self, tokenizer, request_obj, case: ReasoningCase):
@@ -257,6 +286,195 @@ class TestExtractReasoning:
             assert tc["id"] == expected_tc.id
             assert tc["name"] == expected_tc.name
             assert json.loads(tc["arguments"]) == expected_tc.arguments
+
+
+class TestNoReasoningNonstreaming:
+    @pytest.mark.parametrize(
+        "model_output, expected_content",
+        [
+            pytest.param(
+                "## Review\nNo blocking issues found.",
+                "## Review\nNo blocking issues found.",
+                id="bare-content",
+            ),
+            pytest.param(
+                "<|START_TEXT|>answer<|END_TEXT|>",
+                "answer",
+                id="tagged-content",
+            ),
+        ],
+    )
+    def test_reasoning_effort_none_primes_prompt_state(
+        self, tokenizer, model_output: str, expected_content: str
+    ) -> None:
+        parser = CohereCommand4ReasoningParser(tokenizer)
+        request = _make_chat_request(reasoning_effort="none")
+
+        reasoning, content = parser.extract_reasoning(model_output, request)
+
+        assert reasoning is None
+        assert content == expected_content
+
+    @pytest.mark.parametrize(
+        "model_output, expected_content",
+        [
+            pytest.param(
+                "## Review\nNo blocking issues found.",
+                "## Review\nNo blocking issues found.",
+                id="bare-content",
+            ),
+            pytest.param(
+                "<|START_TEXT|>answer<|END_TEXT|>",
+                "<|START_TEXT|>answer<|END_TEXT|>",
+                id="tagged-content",
+            ),
+        ],
+    )
+    def test_streaming_prompt_state_classifies_content_without_reasoning(
+        self, tokenizer, model_output: str, expected_content: str
+    ) -> None:
+        request = _make_chat_request(reasoning_effort="none")
+
+        messages = _stream_messages(tokenizer, model_output, request)
+
+        assert "".join(message.reasoning or "" for message in messages) == ""
+        assert "".join(message.content or "" for message in messages) == (
+            expected_content
+        )
+
+    def test_streaming_prompt_state_classifies_action_without_reasoning(
+        self, tokenizer
+    ) -> None:
+        request = _make_chat_request(
+            reasoning_effort="none",
+            tools=[GET_WEATHER_TOOL],
+        )
+        model_output = (
+            '<|START_ACTION|>[{"tool_call_id":"0",'
+            '"tool_name":"get_weather",'
+            '"parameters":{"city":"Paris"}}]<|END_ACTION|>'
+        )
+
+        messages = _stream_messages(tokenizer, model_output, request)
+
+        assert "".join(message.reasoning or "" for message in messages) == ""
+        tool_deltas = [
+            tool_call for message in messages for tool_call in message.tool_calls
+        ]
+        assert tool_deltas[0].id == "0"
+        assert tool_deltas[0].function.name == "get_weather"
+        assert (
+            "".join(tool_call.function.arguments or "" for tool_call in tool_deltas)
+            == '{"city":"Paris"}'
+        )
+
+    def test_action_remains_available_to_downstream_tool_parser(
+        self, tokenizer
+    ) -> None:
+        parser = CohereCommand4ReasoningParser(tokenizer)
+        request = _make_chat_request(
+            reasoning_effort="none",
+            tools=[GET_WEATHER_TOOL],
+        )
+        model_output = (
+            '<|START_ACTION|>[{"tool_call_id":"0",'
+            '"tool_name":"get_weather",'
+            '"parameters":{"city":"Paris"}}]<|END_ACTION|>'
+        )
+
+        reasoning, content = parser.extract_reasoning(model_output, request)
+        tool_result = CohereCommand4ToolParser(tokenizer).extract_tool_calls(
+            content, request
+        )
+
+        assert reasoning is None
+        assert tool_result.tools_called
+        assert len(tool_result.tool_calls) == 1
+        assert tool_result.tool_calls[0].id == "0"
+        assert tool_result.tool_calls[0].function.name == "get_weather"
+        assert json.loads(tool_result.tool_calls[0].function.arguments) == {
+            "city": "Paris"
+        }
+
+    def test_responses_api_reasoning_effort_none_primes_prompt_state(
+        self, tokenizer
+    ) -> None:
+        parser = CohereCommand4ReasoningParser(tokenizer)
+        request = ResponsesRequest.model_validate(
+            {"input": "Review this patch", "reasoning": {"effort": "none"}}
+        )
+
+        reasoning, content = parser.extract_reasoning("No blocking issues.", request)
+
+        assert reasoning is None
+        assert content == "No blocking issues."
+
+    def test_responses_api_enabled_reasoning_is_unchanged(self, tokenizer) -> None:
+        parser = CohereCommand4ReasoningParser(tokenizer)
+        request = ResponsesRequest.model_validate(
+            {"input": "Review this patch", "reasoning": {"effort": "high"}}
+        )
+
+        reasoning, content = parser.extract_reasoning("Inspect the diff.", request)
+
+        assert reasoning == "Inspect the diff."
+        assert content is None
+
+    def test_explicit_template_reasoning_false_primes_prompt_state(
+        self, tokenizer
+    ) -> None:
+        parser = CohereCommand4ReasoningParser(tokenizer)
+        request = _make_chat_request(
+            reasoning_effort="high",
+            chat_template_kwargs={"reasoning": False},
+        )
+
+        reasoning, content = parser.extract_reasoning("plain response", request)
+
+        assert reasoning is None
+        assert content == "plain response"
+
+    def test_effective_server_template_kwargs_prime_prompt_state(
+        self, tokenizer
+    ) -> None:
+        parser = CohereCommand4ReasoningParser(
+            tokenizer,
+            chat_template_kwargs={"reasoning": False},
+        )
+        request = _make_chat_request()
+
+        reasoning, content = parser.extract_reasoning("plain response", request)
+
+        assert reasoning is None
+        assert content == "plain response"
+
+    def test_effective_server_reasoning_overrides_request_effort(
+        self, tokenizer
+    ) -> None:
+        parser = CohereCommand4ReasoningParser(
+            tokenizer,
+            chat_template_kwargs={"reasoning": True},
+        )
+        request = _make_chat_request(reasoning_effort="none")
+
+        reasoning, content = parser.extract_reasoning("plain response", request)
+
+        assert reasoning == "plain response"
+        assert content is None
+
+    def test_explicit_template_reasoning_overrides_reasoning_effort(
+        self, tokenizer
+    ) -> None:
+        parser = CohereCommand4ReasoningParser(tokenizer)
+        request = _make_chat_request(
+            reasoning_effort="none",
+            chat_template_kwargs={"reasoning": True},
+        )
+
+        reasoning, content = parser.extract_reasoning("plain response", request)
+
+        assert reasoning == "plain response"
+        assert content is None
 
 
 class TestIsReasoningEnd:
